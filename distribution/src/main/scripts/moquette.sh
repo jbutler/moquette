@@ -39,7 +39,7 @@ PRGDIR=`dirname "$PRG"`
 export MOQUETTE_HOME
 
 # Set JavaHome if it exists
-if [ -f "${JAVA_HOME}/bin/java" ]; then 
+if [ -f "${JAVA_HOME}/bin/java" ]; then
    JAVA=${JAVA_HOME}/bin/java
 else
    JAVA=java
@@ -93,6 +93,7 @@ JAVA_OPTS="$JAVA_OPTS -Xloggc:$MOQUETTE_HOME/gc.log"
 #JAVA_OPTS="$JAVA_OPTS -XX:+UseGCLogFileRotation"
 #JAVA_OPTS="$JAVA_OPTS -XX:NumberOfGCLogFiles=10"
 #JAVA_OPTS="$JAVA_OPTS -XX:GCLogFileSize=10M"
+JAVA_OPTS="$JAVA_OPTS -Dio.netty.leakDetectionLevel=paranoid"
 
 echo '$JAVA -server $JAVA_OPTS $JAVA_OPTS_SCRIPT -Dlog4j.configuration="file:$LOG_FILE" -Dmoquette.path="$MOQUETTE_PATH" -cp "$MOQUETTE_HOME/lib/*" io.moquette.broker.Server'
 $JAVA -server $JAVA_OPTS $JAVA_OPTS_SCRIPT -Dlog4j.configuration="file:$LOG_FILE" -Dmoquette.path="$MOQUETTE_PATH" -cp "$MOQUETTE_HOME/lib/*" io.moquette.broker.Server
