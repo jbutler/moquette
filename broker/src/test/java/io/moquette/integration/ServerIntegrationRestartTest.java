@@ -33,6 +33,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -42,6 +44,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class ServerIntegrationRestartTest {
+    private static final Logger LOG = LoggerFactory.getLogger(ServerIntegrationRestartTest.class);
 
     static MqttConnectOptions CLEAN_SESSION_OPT = new MqttConnectOptions();
 
@@ -98,9 +101,10 @@ public class ServerIntegrationRestartTest {
         m_server.stopServer();
     }
 
-    @DisplayName("given not clean session then after a server restart the session should be present")
+    @DisplayName("given not clean session after a server restart, the session is still present")
     @Test
     public void testNotCleanSessionIsVisibleAfterServerRestart() throws Exception {
+        LOG.info("*** testNotCleanSessionIsVisibleAfterServerRestart ***");
         m_subscriber.connect(CLEAN_SESSION_OPT);
         m_subscriber.subscribe("/topic", 1);
         m_subscriber.disconnect();
@@ -114,6 +118,7 @@ public class ServerIntegrationRestartTest {
 
         //reconnect subscriber and topic should be sent
         m_subscriber.connect(CLEAN_SESSION_OPT);
+
         // verify the sent message while offline is read
         Awaitility.await().until(m_messageCollector::isMessageReceived);
         MqttMessage msg = m_messageCollector.retrieveMessage();
@@ -122,6 +127,7 @@ public class ServerIntegrationRestartTest {
 
     @Test
     public void checkRestartCleanSubscriptionTree() throws Exception {
+        LOG.info("*** checkRestartCleanSubscriptionTree ***");
         // subscribe to /topic
         m_subscriber.connect(CLEAN_SESSION_OPT);
         m_subscriber.subscribe("/topic", 1);
@@ -153,6 +159,7 @@ public class ServerIntegrationRestartTest {
 
     @Test
     public void checkDontPublishInactiveClientsAfterServerRestart() throws Exception {
+        LOG.info("*** checkDontPublishInactiveClientsAfterServerRestart ***");
         IMqttClient conn = subscribeAndPublish("/topic");
         conn.disconnect();
 
@@ -168,6 +175,7 @@ public class ServerIntegrationRestartTest {
 
     @Test
     public void testClientDoesntRemainSubscribedAfterASubscriptionAndServerRestart() throws Exception {
+        LOG.info("*** testClientDoesntRemainSubscribedAfterASubscriptionAndServerRestart ***");
         // subscribe to /topic
         m_subscriber.connect();
         // subscribe /topic

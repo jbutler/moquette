@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -38,7 +39,6 @@ import static io.netty.channel.ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.*;
 import static io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader.from;
 import static io.netty.handler.codec.mqtt.MqttQoS.*;
-import io.netty.util.ReferenceCountUtil;
 
 final class MQTTConnection {
 
@@ -108,12 +108,18 @@ final class MQTTConnection {
 
     private void processPubComp(MqttMessage msg) {
         final int messageID = ((MqttMessageIdVariableHeader) msg.variableHeader()).messageId();
-        bindedSession.processPubComp(messageID);
+        this.postOffice.routeCommand(bindedSession.getClientID(), "PUBCOMP", () -> {
+            bindedSession.processPubComp(messageID);
+            return bindedSession.getClientID();
+        });
     }
 
     private void processPubRec(MqttMessage msg) {
         final int messageID = ((MqttMessageIdVariableHeader) msg.variableHeader()).messageId();
-        bindedSession.processPubRec(messageID);
+        this.postOffice.routeCommand(bindedSession.getClientID(), "PUBREC", () -> {
+            bindedSession.processPubRec(messageID);
+            return null;
+        });
     }
 
     static MqttMessage pubrel(int messageID) {
@@ -123,10 +129,14 @@ final class MQTTConnection {
 
     private void processPubAck(MqttMessage msg) {
         final int messageID = ((MqttMessageIdVariableHeader) msg.variableHeader()).messageId();
-        bindedSession.pubAckReceived(messageID);
+        final String clientId = getClientId();
+        this.postOffice.routeCommand(clientId, "PUB ACK", () -> {
+            bindedSession.pubAckReceived(messageID);
+            return null;
+        });
     }
 
-    void processConnect(MqttConnectMessage msg) {
+    PostOffice.RouteResult processConnect(MqttConnectMessage msg) {
         MqttConnectPayload payload = msg.payload();
         String clientId = payload.clientIdentifier();
         final String username = payload.userName();
@@ -135,20 +145,20 @@ final class MQTTConnection {
         if (isNotProtocolVersion(msg, MqttVersion.MQTT_3_1) && isNotProtocolVersion(msg, MqttVersion.MQTT_3_1_1)) {
             LOG.warn("MQTT protocol version is not valid. CId: {}", clientId);
             abortConnection(CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION);
-            return;
+            return PostOffice.RouteResult.failed(clientId);
         }
         final boolean cleanSession = msg.variableHeader().isCleanSession();
         if (clientId == null || clientId.length() == 0) {
             if (!brokerConfig.isAllowZeroByteClientId()) {
                 LOG.info("Broker doesn't permit MQTT empty client ID. Username: {}", username);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
-                return;
+                return PostOffice.RouteResult.failed(clientId);
             }
 
             if (!cleanSession) {
                 LOG.info("MQTT client ID cannot be empty for persistent session. Username: {}", username);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
-                return;
+                return PostOffice.RouteResult.failed(clientId);
             }
 
             // Generating client id.
@@ -159,9 +169,20 @@ final class MQTTConnection {
         if (!login(msg, clientId)) {
             abortConnection(CONNECTION_REFUSED_BAD_USER_NAME_OR_PASSWORD);
             channel.close().addListener(CLOSE_ON_FAILURE);
-            return;
+            return PostOffice.RouteResult.failed(clientId);
         }
 
+        final String sessionId = clientId;
+        return postOffice.routeCommand(clientId, "CONN", () -> {
+            executeConnect(msg, sessionId);
+            return null;
+        });
+    }
+
+    /**
+     * Invoked by the Session's event loop.
+     * */
+    private void executeConnect(MqttConnectMessage msg, String clientId) {
         final SessionRegistry.SessionCreationResult result;
         try {
             LOG.trace("Binding MQTTConnection to session");
@@ -203,11 +224,11 @@ final class MQTTConnection {
                         setupInflightResender(channel);
 
                         postOffice.dispatchConnection(msg);
-                        LOG.trace("dispatch connection: {}", msg.toString());
+                        LOG.trace("dispatch connection: {}", msg);
                     }
                 } else {
                     bindedSession.disconnect();
-                    sessionRegistry.remove(bindedSession);
+                    sessionRegistry.remove(bindedSession.getClientID());
                     LOG.error("CONNACK send failed, cleanup session and close the connection", future.cause());
                     channel.close();
                 }
@@ -276,17 +297,30 @@ final class MQTTConnection {
     }
 
     void handleConnectionLost() {
-        String clientID = NettyUtils.clientID(channel);
+        final String clientID = NettyUtils.clientID(channel);
         if (clientID == null || clientID.isEmpty()) {
             return;
         }
-        LOG.info("Notifying connection lost event");
+        // this must not be done on the netty thread
+        LOG.debug("Notifying connection lost event");
+        postOffice.routeCommand(clientID, "CONN LOST", () -> {
+            if (isBoundToSession() || isSessionUnbound()) {
+                LOG.debug("Cleaning {}", clientID);
+                processConnectionLost(clientID);
+            } else {
+                LOG.debug("NOT Cleaning {}, bound to other connection.", clientID);
+            }
+            return null;
+        });
+    }
+
+    private void processConnectionLost(String clientID) {
         if (bindedSession.hasWill()) {
             postOffice.fireWill(bindedSession.getWill());
         }
         if (bindedSession.isClean()) {
-            LOG.debug("Remove session for client");
-            sessionRegistry.remove(bindedSession);
+            LOG.debug("Remove session for client {}", clientID);
+            sessionRegistry.remove(bindedSession.getClientID());
         } else {
             bindedSession.disconnect();
         }
@@ -305,30 +339,42 @@ final class MQTTConnection {
         channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
     }
 
-    void processDisconnect(MqttMessage msg) {
+    PostOffice.RouteResult processDisconnect(MqttMessage msg) {
         final String clientID = NettyUtils.clientID(channel);
         LOG.trace("Start DISCONNECT");
         if (!connected) {
             LOG.info("DISCONNECT received on already closed connection");
-            return;
+            return PostOffice.RouteResult.success(clientID, CompletableFuture.completedFuture(null));
         }
-        bindedSession.disconnect();
-        connected = false;
-        channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
-        LOG.trace("Processed DISCONNECT");
-        String userName = NettyUtils.userName(channel);
-        postOffice.dispatchDisconnection(clientID, userName);
-        LOG.trace("dispatch disconnection userName={}", userName);
+
+        return this.postOffice.routeCommand(clientID, "DISCONN", () -> {
+            if (!isBoundToSession()) {
+                LOG.debug("NOT processing disconnect {}, not bound.", clientID);
+                return null;
+            }
+            bindedSession.disconnect();
+            connected = false;
+            channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
+            String userName = NettyUtils.userName(channel);
+            postOffice.clientDisconnected(clientID, userName);
+            LOG.trace("dispatch disconnection userName={}", userName);
+            return null;
+        });
     }
 
-    void processSubscribe(MqttSubscribeMessage msg) {
+    PostOffice.RouteResult processSubscribe(MqttSubscribeMessage msg) {
         final String clientID = NettyUtils.clientID(channel);
         if (!connected) {
             LOG.warn("SUBSCRIBE received on already closed connection");
             dropConnection();
-            return;
+            return PostOffice.RouteResult.success(clientID, CompletableFuture.completedFuture(null));
         }
-        postOffice.subscribeClientToTopics(msg, clientID, NettyUtils.userName(channel), this);
+        final String username = NettyUtils.userName(channel);
+        return postOffice.routeCommand(clientID, "SUB", () -> {
+            if (isBoundToSession())
+                postOffice.subscribeClientToTopics(msg, clientID, username, this);
+            return null;
+        });
     }
 
     void sendSubAckMessage(int messageID, MqttSubAckMessage ackMessage) {
@@ -338,10 +384,16 @@ final class MQTTConnection {
 
     private void processUnsubscribe(MqttUnsubscribeMessage msg) {
         List<String> topics = msg.payload().topics();
-        String clientID = NettyUtils.clientID(channel);
+        final String clientID = NettyUtils.clientID(channel);
+        final int messageId = msg.variableHeader().messageId();
 
-        LOG.trace("Processing UNSUBSCRIBE message. topics: {}", topics);
-        postOffice.unsubscribe(topics, this, msg.variableHeader().messageId());
+        postOffice.routeCommand(clientID, "UNSUB", () -> {
+            if (!isBoundToSession())
+                return null;
+            LOG.trace("Processing UNSUBSCRIBE message. topics: {}", topics);
+            postOffice.unsubscribe(topics, this, messageId);
+            return null;
+        });
     }
 
     void sendUnsubAckMessage(List<String> topics, String clientID, int messageID) {
@@ -354,7 +406,7 @@ final class MQTTConnection {
         LOG.trace("Client unsubscribed from topics <{}>", topics);
     }
 
-    void processPublish(MqttPublishMessage msg) {
+    PostOffice.RouteResult processPublish(MqttPublishMessage msg) {
         final MqttQoS qos = msg.fixedHeader().qosLevel();
         final String username = NettyUtils.userName(channel);
         final String topicName = msg.variableHeader().topicName();
@@ -366,26 +418,49 @@ final class MQTTConnection {
             LOG.debug("Drop connection because of invalid topic format");
             dropConnection();
         }
+
+        // retain else msg is cleaned by the NewNettyMQTTHandler and is not available
+        // in execution by SessionEventLoop
+        msg.retain();
         switch (qos) {
             case AT_MOST_ONCE:
-                postOffice.receivedPublishQos0(topic, username, clientId, msg);
-                break;
-            case AT_LEAST_ONCE: {
-                postOffice.receivedPublishQos1(this, topic, username, messageID, msg);
-                break;
-            }
+                return postOffice.routeCommand(clientId, "PUB QoS0", () -> {
+                    if (!isBoundToSession())
+                        return null;
+                    postOffice.receivedPublishQos0(topic, username, clientId, msg);
+                    return null;
+                }).ifFailed(msg::release);
+            case AT_LEAST_ONCE:
+                return postOffice.routeCommand(clientId, "PUB QoS1", () -> {
+                    if (!isBoundToSession())
+                        return null;
+                    postOffice.receivedPublishQos1(this, topic, username, messageID, msg);
+                    return null;
+                }).ifFailed(msg::release);
             case EXACTLY_ONCE: {
-                bindedSession.receivedPublishQos2(messageID, msg);
-                postOffice.receivedPublishQos2(this, msg, username);
-                break;
+                final PostOffice.RouteResult firstStepResult = postOffice.routeCommand(clientId, "PUB QoS2", () -> {
+                    if (!isBoundToSession())
+                        return null;
+                    bindedSession.receivedPublishQos2(messageID, msg);
+                    return null;
+                });
+                if (!firstStepResult.isSuccess()) {
+                    msg.release();
+                    LOG.trace("Failed to enqueue PUB QoS2 to session loop for  {}", clientId);
+                    return firstStepResult;
+                }
+                firstStepResult.completableFuture().thenRun(() ->
+                    postOffice.receivedPublishQos2(this, msg, username).completableFuture()
+                );
+                return firstStepResult;
             }
             default:
                 LOG.error("Unknown QoS-Type:{}", qos);
-                break;
+                return PostOffice.RouteResult.failed(clientId, "Unknown QoS-");
         }
     }
 
-    void sendPublishReceived(int messageID) {
+    void sendPubRec(int messageID) {
         LOG.trace("sendPubRec invoked, messageID: {}", messageID);
         MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBREC, false, AT_MOST_ONCE,
             false, 0);
@@ -395,6 +470,13 @@ final class MQTTConnection {
 
     private void processPubRel(MqttMessage msg) {
         final int messageID = ((MqttMessageIdVariableHeader) msg.variableHeader()).messageId();
+        postOffice.routeCommand(bindedSession.getClientID(), "PUBREL", () -> {
+            executePubRel(messageID);
+            return null;
+        });
+    }
+
+    private void executePubRel(int messageID) {
         bindedSession.receivedPubRelQos2(messageID);
         sendPubCompMessage(messageID);
     }
@@ -402,7 +484,6 @@ final class MQTTConnection {
     void sendPublish(MqttPublishMessage publishMsg) {
         final int packetId = publishMsg.variableHeader().packetId();
         final String topicName = publishMsg.variableHeader().topicName();
-        final String clientId = getClientId();
         MqttQoS qos = publishMsg.fixedHeader().qosLevel();
         if (LOG.isTraceEnabled()) {
             LOG.trace("Sending PUBLISH({}) message. MessageId={}, topic={}, payload={}", qos, packetId, topicName,
@@ -466,41 +547,39 @@ final class MQTTConnection {
         return NettyUtils.userName(channel);
     }
 
-    public void sendPublishRetainedQos0(Topic topic, MqttQoS qos, ByteBuf payload) {
-        MqttPublishMessage publishMsg = retainedPublish(topic.toString(), qos, payload);
-        sendPublish(publishMsg);
-    }
-
-    public void sendPublishRetainedWithPacketId(Topic topic, MqttQoS qos, ByteBuf payload) {
+    public void sendPublishWithPacketId(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
         final int packetId = nextPacketId();
-        MqttPublishMessage publishMsg = retainedPublishWithMessageId(topic.toString(), qos, payload, packetId);
+        MqttPublishMessage publishMsg = createPublishMessage(topic.toString(), qos, payload, packetId, retained);
         sendPublish(publishMsg);
-    }
-
-    private static MqttPublishMessage retainedPublish(String topic, MqttQoS qos, ByteBuf message) {
-        return retainedPublishWithMessageId(topic, qos, message, 0);
-    }
-
-    private static MqttPublishMessage retainedPublishWithMessageId(String topic, MqttQoS qos, ByteBuf message,
-                                                                   int messageId) {
-        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, false, qos, true, 0);
-        MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic, messageId);
-        return new MqttPublishMessage(fixedHeader, varHeader, message);
     }
 
     // TODO move this method in Session
-    void sendPublishNotRetainedQos0(Topic topic, MqttQoS qos, ByteBuf payload) {
-        MqttPublishMessage publishMsg = notRetainedPublish(topic.toString(), qos, payload);
+    void sendPublishQos0(Topic topic, MqttQoS qos, ByteBuf payload, boolean retained) {
+        MqttPublishMessage publishMsg = createPublishMessage(topic.toString(), qos, payload, 0, retained);
         sendPublish(publishMsg);
     }
 
-    static MqttPublishMessage notRetainedPublish(String topic, MqttQoS qos, ByteBuf message) {
-        return notRetainedPublishWithMessageId(topic, qos, message, 0);
+    static MqttPublishMessage createRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message) {
+        return createPublishMessage(topic, qos, message, 0, true);
     }
 
-    static MqttPublishMessage notRetainedPublishWithMessageId(String topic, MqttQoS qos, ByteBuf message,
+    static MqttPublishMessage createNonRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message) {
+        return createPublishMessage(topic, qos, message, 0, false);
+    }
+
+    static MqttPublishMessage createRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message,
+                                                           int messageId) {
+        return createPublishMessage(topic, qos, message, messageId, true);
+    }
+
+    static MqttPublishMessage createNotRetainedPublishMessage(String topic, MqttQoS qos, ByteBuf message,
                                                               int messageId) {
-        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, false, qos, false, 0);
+        return createPublishMessage(topic, qos, message, messageId, false);
+    }
+
+    private static MqttPublishMessage createPublishMessage(String topic, MqttQoS qos, ByteBuf message,
+                                                           int messageId, boolean retained) {
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, false, qos, retained, 0);
         MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic, messageId);
         return new MqttPublishMessage(fixedHeader, varHeader, message);
     }
@@ -532,5 +611,17 @@ final class MQTTConnection {
 
     public void flush() {
         channel.flush();
+    }
+
+    private boolean isBoundToSession() {
+        return bindedSession != null && bindedSession.isBoundTo(this);
+    }
+
+    private boolean isSessionUnbound() {
+        return bindedSession != null && bindedSession.isBoundTo(null);
+    }
+
+    public void bindSession(Session session) {
+        bindedSession = session;
     }
 }

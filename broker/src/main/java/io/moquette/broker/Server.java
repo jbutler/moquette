@@ -54,7 +54,11 @@ public class Server {
 
     public static void main(String[] args) throws IOException {
         final Server server = new Server();
-        server.startServer();
+        try {
+            server.startServer();
+        } catch (RuntimeException e) {
+            System.exit(1);
+        }
         System.out.println("Server started, version 0.16-SNAPSHOT");
         //Bind a shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(server::stopServer));
@@ -178,7 +182,9 @@ public class Server {
         subscriptions.init(subscriptionsRepository);
         final Authorizator authorizator = new Authorizator(authorizatorPolicy);
         sessions = new SessionRegistry(subscriptions, queueRepository, authorizator);
-        dispatcher = new PostOffice(subscriptions, retainedRepository, sessions, interceptor, authorizator);
+        final int sessionQueueSize = config.intProp(BrokerConstants.SESSION_QUEUE_SIZE, 1024);
+        dispatcher = new PostOffice(subscriptions, retainedRepository, sessions, interceptor, authorizator,
+                                    sessionQueueSize);
         final BrokerConfiguration brokerConfig = new BrokerConfiguration(config);
         MQTTConnectionFactory connectionFactory = new MQTTConnectionFactory(brokerConfig, authenticator, sessions,
                                                                             dispatcher);
@@ -298,8 +304,9 @@ public class Server {
      * @param msg      the message to forward. The ByteBuf in the message will be released.
      * @param clientId the id of the sending integration.
      * @throws IllegalStateException if the integration is not yet started
+     * @return
      */
-    public void internalPublish(MqttPublishMessage msg, final String clientId) {
+    public RoutingResults internalPublish(MqttPublishMessage msg, final String clientId) {
         final int messageID = msg.variableHeader().packetId();
         if (!initialized) {
             LOG.error("Moquette is not started, internal message cannot be published. CId: {}, messageId: {}", clientId,
@@ -307,8 +314,9 @@ public class Server {
             throw new IllegalStateException("Can't publish on a integration is not yet started");
         }
         LOG.trace("Internal publishing message CId: {}, messageId: {}", clientId, messageID);
-        dispatcher.internalPublish(msg);
+        final RoutingResults routingResults = dispatcher.internalPublish(msg);
         msg.payload().release();
+        return routingResults;
     }
 
     public void stopServer() {
@@ -327,6 +335,7 @@ public class Server {
         }
 
         interceptor.stop();
+        dispatcher.terminate();
         LOG.info("Moquette integration has been stopped.");
     }
 
